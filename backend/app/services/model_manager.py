@@ -2,7 +2,8 @@ import os
 import pickle
 import threading
 import time
-from typing import Optional, Tuple, List
+import uuid
+from typing import Optional, Tuple, List, Dict
 from pathlib import Path
 import numpy as np
 import torch
@@ -10,9 +11,102 @@ import torch
 from app.services.siamese_model import VoiceprintSiameseModel
 from app.services.feature_normalizer import AdaptiveNormalizer
 from app.core.config import settings
+from app.database import get_db
+from app.models import Tenant
 
 
-class ModelManager:
+class TenantModelContainer:
+    def __init__(self, tenant_id: int, model_dir: Path):
+        self.tenant_id = tenant_id
+        self.model_dir = model_dir
+        self.model: Optional[VoiceprintSiameseModel] = None
+        self.normalizer: Optional[AdaptiveNormalizer] = None
+        self.model_last_modified: Optional[float] = None
+        self.normalizer_last_modified: Optional[float] = None
+        self.lock = threading.RLock()
+        self.load_count = 0
+
+    @property
+    def model_path(self) -> Path:
+        return self.model_dir / f"tenant_{self.tenant_id}" / "voiceprint_siamese.pt"
+
+    @property
+    def normalizer_path(self) -> Path:
+        return self.model_dir / f"tenant_{self.tenant_id}" / "normalizer.pkl"
+
+    def ensure_dirs(self):
+        self.model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self, force_reload: bool = False):
+        with self.lock:
+            if self.model is not None and not force_reload:
+                if not self._needs_reload():
+                    return
+
+            self.ensure_dirs()
+
+            if self.model_path.exists():
+                try:
+                    print(f"[Tenant {self.tenant_id}] Loading model from {self.model_path}")
+                    self.model = VoiceprintSiameseModel(input_dim=200, embedding_dim=128)
+                    self.model.load(str(self.model_path))
+                    self.model.model.eval()
+                    self.model_last_modified = os.path.getmtime(self.model_path)
+                except Exception as e:
+                    print(f"[Tenant {self.tenant_id}] Failed to load model: {e}")
+                    self._create_default_model()
+            else:
+                print(f"[Tenant {self.tenant_id}] No custom model found, using default")
+                self._create_default_model()
+
+            if self.normalizer_path.exists():
+                try:
+                    print(f"[Tenant {self.tenant_id}] Loading normalizer from {self.normalizer_path}")
+                    with open(self.normalizer_path, 'rb') as f:
+                        self.normalizer = pickle.load(f)
+                    self.normalizer_last_modified = os.path.getmtime(self.normalizer_path)
+                except Exception as e:
+                    print(f"[Tenant {self.tenant_id}] Failed to load normalizer: {e}")
+                    self._create_default_normalizer()
+            else:
+                self._create_default_normalizer()
+
+            self.load_count += 1
+
+    def _needs_reload(self) -> bool:
+        try:
+            if self.model_path.exists():
+                mtime = os.path.getmtime(self.model_path)
+                if self.model_last_modified is None or mtime > self.model_last_modified:
+                    return True
+            if self.normalizer_path.exists():
+                mtime = os.path.getmtime(self.normalizer_path)
+                if self.normalizer_last_modified is None or mtime > self.normalizer_last_modified:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _create_default_model(self):
+        self.model = VoiceprintSiameseModel(
+            input_dim=200,
+            embedding_dim=128,
+            margin=0.5
+        )
+        self.model.model.eval()
+        self.model_last_modified = time.time()
+
+    def _create_default_normalizer(self):
+        self.normalizer = AdaptiveNormalizer(feature_dim=200)
+        self.normalizer_last_modified = time.time()
+
+    def check_and_reload(self):
+        if self._needs_reload():
+            print(f"[Tenant {self.tenant_id}] Model files updated, reloading...")
+            self.load(force_reload=True)
+
+
+class MultiTenantModelManager:
     _instance = None
     _lock = threading.Lock()
 
@@ -30,87 +124,171 @@ class ModelManager:
         self._initialized = True
 
         self.model_dir = Path(os.getenv('MODEL_DIR', 'backend/models'))
-        self.model_path = self.model_dir / 'voiceprint_siamese.pt'
-        self.normalizer_path = self.model_dir / 'normalizer.pkl'
-
-        self._model: Optional[VoiceprintSiameseModel] = None
-        self._normalizer: Optional[AdaptiveNormalizer] = None
-
-        self._model_last_modified = None
-        self._normalizer_last_modified = None
-        self._watch_thread = None
-        self._watch_running = False
-
-        self._init_models()
-        self._start_file_watcher()
-
-    def _init_models(self):
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
-        if self.model_path.exists():
-            try:
-                self._load_model()
-            except Exception as e:
-                print(f"Warning: Failed to load model: {e}")
-                self._create_default_model()
+        self._tenants: Dict[int, TenantModelContainer] = {}
+        self._global_container = TenantModelContainer(tenant_id=0, model_dir=self.model_dir)
+        self._global_container.load()
+
+        self._watch_thread = None
+        self._watch_running = False
+        self._start_file_watcher()
+
+    def _get_tenant_container(self, tenant_id: int) -> TenantModelContainer:
+        if tenant_id not in self._tenants:
+            with self._lock:
+                if tenant_id not in self._tenants:
+                    container = TenantModelContainer(tenant_id=tenant_id, model_dir=self.model_dir)
+                    container.load()
+                    self._tenants[tenant_id] = container
+        return self._tenants[tenant_id]
+
+    def get_model(self, tenant_id: int) -> VoiceprintSiameseModel:
+        if tenant_id is None or tenant_id <= 0:
+            return self._global_container.model
+        container = self._get_tenant_container(tenant_id)
+        return container.model
+
+    def get_normalizer(self, tenant_id: int) -> AdaptiveNormalizer:
+        if tenant_id is None or tenant_id <= 0:
+            return self._global_container.normalizer
+        container = self._get_tenant_container(tenant_id)
+        return container.normalizer
+
+    def get_threshold(self, tenant_id: int, db=None) -> float:
+        if tenant_id and tenant_id > 0 and db:
+            tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+            if tenant and tenant.voiceprint_threshold:
+                return tenant.voiceprint_threshold
+        return getattr(settings, 'voiceprint_similarity_threshold', 0.70)
+
+    def verify_voiceprints(
+        self,
+        input_feature: np.ndarray,
+        stored_vectors: List[np.ndarray],
+        tenant_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        use_dtw_alignment: bool = True,
+        db=None
+    ) -> Tuple[bool, float, dict]:
+        normalizer = self.get_normalizer(tenant_id)
+        model = self.get_model(tenant_id)
+        threshold = self.get_threshold(tenant_id, db)
+        weights = getattr(settings, 'similarity_weights', {
+            'model': 0.5, 'dtw': 0.3, 'cosine': 0.2
+        })
+
+        normalized_input = normalizer.normalize(input_feature, user_id=user_id)
+
+        if use_dtw_alignment and len(stored_vectors) > 0:
+            from app.services.dtw_aligner import DynamicTimeWarping
+            dtw = DynamicTimeWarping(window_size=getattr(settings, 'dtw_window_size', 50))
+
+            best_similarity = 0.0
+            all_details = []
+            best_detail = {}
+
+            for idx, stored_vec in enumerate(stored_vectors):
+                normalized_stored = normalizer.normalize(
+                    np.array(stored_vec),
+                    user_id=user_id
+                )
+
+                _, _, dtw_cost, _ = dtw.align(
+                    normalized_input.reshape(-1, 1),
+                    normalized_stored.reshape(-1, 1)
+                )
+
+                model_sim = model.compute_similarity(normalized_input, normalized_stored)
+                dtw_sim = 1.0 / (1.0 + dtw_cost * 5)
+                cos_sim = float(
+                    np.dot(
+                        normalized_input / (np.linalg.norm(normalized_input) + 1e-10),
+                        normalized_stored / (np.linalg.norm(normalized_stored) + 1e-10)
+                    )
+                )
+
+                combined = (
+                    weights.get('model', 0.5) * model_sim +
+                    weights.get('dtw', 0.3) * dtw_sim +
+                    weights.get('cosine', 0.2) * cos_sim
+                )
+
+                detail = {
+                    'voiceprint_index': idx,
+                    'model_similarity': round(model_sim, 4),
+                    'dtw_similarity': round(dtw_sim, 4),
+                    'dtw_cost': round(dtw_cost, 4),
+                    'cosine_similarity': round(cos_sim, 4),
+                    'combined_similarity': round(combined, 4),
+                }
+                all_details.append(detail)
+
+                if combined > best_similarity:
+                    best_similarity = combined
+                    best_detail = detail
+
+            success = best_similarity >= threshold
+            return success, best_similarity, {
+                'threshold': threshold,
+                'tenant_id': tenant_id,
+                'best_match': best_detail,
+                'all_matches': all_details,
+                'weights': weights,
+                'method': 'tenant_dtw_siamese_cosine',
+            }
+
         else:
-            print("No pre-trained model found, creating default model...")
-            self._create_default_model()
+            max_similarity = 0.0
+            for stored_vec in stored_vectors:
+                normalized_stored = normalizer.normalize(
+                    np.array(stored_vec),
+                    user_id=user_id
+                )
+                sim = model.compute_similarity(normalized_input, normalized_stored)
+                if sim > max_similarity:
+                    max_similarity = sim
 
-        if self.normalizer_path.exists():
-            try:
-                self._load_normalizer()
-            except Exception as e:
-                print(f"Warning: Failed to load normalizer: {e}")
-                self._create_default_normalizer()
+            success = max_similarity >= threshold
+            return success, max_similarity, {
+                'threshold': threshold,
+                'tenant_id': tenant_id,
+                'model_similarity': max_similarity,
+                'dtw_used': False,
+                'method': 'tenant_siamese',
+            }
+
+    def get_tenant_model_info(self, tenant_id: int) -> dict:
+        if tenant_id <= 0:
+            container = self._global_container
         else:
-            self._create_default_normalizer()
+            container = self._get_tenant_container(tenant_id)
 
-    def _create_default_model(self):
-        print("Creating default Siamese model...")
-        self._model = VoiceprintSiameseModel(
-            input_dim=200,
-            embedding_dim=128,
-            margin=0.5
-        )
-        self._model.model.eval()
-        self._model_last_modified = time.time()
+        return {
+            'tenant_id': tenant_id,
+            'model_path': str(container.model_path),
+            'model_exists': container.model_path.exists(),
+            'normalizer_path': str(container.normalizer_path),
+            'normalizer_exists': container.normalizer_path.exists(),
+            'model_last_modified': container.model_last_modified,
+            'normalizer_last_modified': container.normalizer_last_modified,
+            'load_count': container.load_count,
+        }
 
-    def _create_default_normalizer(self):
-        print("Creating default feature normalizer...")
-        self._normalizer = AdaptiveNormalizer(feature_dim=200)
-        self._normalizer_last_modified = time.time()
+    def reload_tenant_model(self, tenant_id: int):
+        if tenant_id <= 0:
+            self._global_container.load(force_reload=True)
+        elif tenant_id in self._tenants:
+            self._tenants[tenant_id].load(force_reload=True)
 
-    def _load_model(self):
-        print(f"Loading model from {self.model_path}...")
-        self._model = VoiceprintSiameseModel(input_dim=200, embedding_dim=128)
-        self._model.load(str(self.model_path))
-        self._model.model.eval()
-        self._model_last_modified = os.path.getmtime(self.model_path)
-        print("Model loaded successfully")
-
-    def _load_normalizer(self):
-        print(f"Loading normalizer from {self.normalizer_path}...")
-        with open(self.normalizer_path, 'rb') as f:
-            self._normalizer = pickle.load(f)
-        self._normalizer_last_modified = os.path.getmtime(self.normalizer_path)
-        print("Normalizer loaded successfully")
-
-    def _reload_if_updated(self):
-        try:
-            if self.model_path.exists():
-                current_mtime = os.path.getmtime(self.model_path)
-                if self._model_last_modified is None or current_mtime > self._model_last_modified:
-                    print(f"Model file changed, reloading...")
-                    self._load_model()
-
-            if self.normalizer_path.exists():
-                current_mtime = os.path.getmtime(self.normalizer_path)
-                if self._normalizer_last_modified is None or current_mtime > self._normalizer_last_modified:
-                    print(f"Normalizer file changed, reloading...")
-                    self._load_normalizer()
-        except Exception as e:
-            print(f"Error reloading models: {e}")
+    def reload_all_models(self):
+        print("Reloading all tenant models...")
+        self._global_container.load(force_reload=True)
+        for tenant_id, container in self._tenants.items():
+            try:
+                container.load(force_reload=True)
+            except Exception as e:
+                print(f"Failed to reload model for tenant {tenant_id}: {e}")
 
     def _start_file_watcher(self):
         if self._watch_thread is not None:
@@ -121,136 +299,65 @@ class ModelManager:
         def watch_loop():
             while self._watch_running:
                 try:
-                    self._reload_if_updated()
+                    self._global_container.check_and_reload()
+                    for container in self._tenants.values():
+                        container.check_and_reload()
                 except Exception as e:
-                    print(f"File watcher error: {e}")
-                time.sleep(5)
+                    print(f"Model watcher error: {e}")
+                time.sleep(10)
 
         self._watch_thread = threading.Thread(target=watch_loop, daemon=True)
         self._watch_thread.start()
 
-    def stop_watcher(self):
-        self._watch_running = False
-        if self._watch_thread:
-            self._watch_thread.join()
+    def list_loaded_tenants(self) -> list:
+        return [
+            self.get_tenant_model_info(tid)
+            for tid in self._tenants.keys()
+        ]
 
-    @property
-    def model(self) -> VoiceprintSiameseModel:
-        if self._model is None:
-            self._create_default_model()
-        return self._model
-
-    @property
-    def normalizer(self) -> AdaptiveNormalizer:
-        if self._normalizer is None:
-            self._create_default_normalizer()
-        return self._normalizer
-
-    def is_model_trained(self) -> bool:
-        return self.model_path.exists()
-
-    def get_model_info(self) -> dict:
-        return {
-            "model_path": str(self.model_path),
-            "model_exists": self.model_path.exists(),
-            "normalizer_path": str(self.normalizer_path),
-            "normalizer_exists": self.normalizer_path.exists(),
-            "model_last_modified": self._model_last_modified,
-            "normalizer_last_modified": self._normalizer_last_modified,
-            "input_dim": 200,
-            "embedding_dim": self.model.embedding_dim if self._model else 128,
-            "is_trained": self.is_model_trained(),
-        }
-
-    def reload_models(self):
-        print("Manual model reload triggered")
-        if self.model_path.exists():
-            self._load_model()
-        if self.normalizer_path.exists():
-            self._load_normalizer()
-
-    def verify_voiceprints(
+    def train_tenant_model(
         self,
-        input_feature: np.ndarray,
-        stored_vectors: List[np.ndarray],
-        user_id: Optional[int] = None,
-        use_dtw_alignment: bool = True
-    ) -> Tuple[bool, float, dict]:
-        normalized_input = self.normalizer.normalize(input_feature, user_id=user_id)
+        tenant_id: int,
+        features: List[np.ndarray],
+        labels: List[int],
+        n_epochs: int = 50
+    ) -> Tuple[bool, str]:
+        try:
+            from scripts.train_siamese import VoiceprintDataset, train_model
+            import tempfile
 
-        if use_dtw_alignment and len(stored_vectors) > 0:
-            from app.services.dtw_aligner import DynamicTimeWarping
-            dtw = DynamicTimeWarping(window_size=30)
+            container = self._get_tenant_container(tenant_id)
+            container.ensure_dirs()
 
-            best_similarity = 0.0
-            dtw_costs = []
+            temp_dir = Path(tempfile.mkdtemp())
+            temp_model_path = temp_dir / "temp_model.pt"
 
-            for stored_vec in stored_vectors:
-                normalized_stored = self.normalizer.normalize(
-                    np.array(stored_vec),
-                    user_id=user_id
-                )
+            model = train_model(
+                output_path=str(temp_model_path),
+                feature_dim=200,
+                embedding_dim=128,
+                n_epochs=n_epochs,
+                batch_size=min(64, max(8, len(features) // 4)),
+            )
 
-                _, _, dtw_cost, _ = dtw.align(
-                    normalized_input.reshape(-1, 1),
-                    normalized_stored.reshape(-1, 1)
-                )
-                dtw_costs.append(dtw_cost)
+            if temp_model_path.exists():
+                import shutil
+                shutil.copy(str(temp_model_path), str(container.model_path))
+                print(f"[Tenant {tenant_id}] Model trained and saved")
+                container.load(force_reload=True)
+                return True, "Model trained successfully"
 
-                model_similarity = self.model.compute_similarity(
-                    normalized_input,
-                    normalized_stored
-                )
-
-                dtw_similarity = 1.0 / (1.0 + dtw_cost)
-
-                combined_similarity = 0.6 * model_similarity + 0.4 * dtw_similarity
-
-                if combined_similarity > best_similarity:
-                    best_similarity = combined_similarity
-
-            threshold = getattr(settings, 'voiceprint_similarity_threshold', 0.7)
-            success = best_similarity >= threshold
-
-            return success, best_similarity, {
-                "model_similarity": model_similarity if stored_vectors else 0,
-                "dtw_costs": dtw_costs,
-                "threshold": threshold,
-            }
-
-        else:
-            max_similarity = 0.0
-            for stored_vec in stored_vectors:
-                normalized_stored = self.normalizer.normalize(
-                    np.array(stored_vec),
-                    user_id=user_id
-                )
-                similarity = self.model.compute_similarity(
-                    normalized_input,
-                    normalized_stored
-                )
-                if similarity > max_similarity:
-                    max_similarity = similarity
-
-            threshold = getattr(settings, 'voiceprint_similarity_threshold', 0.7)
-            success = max_similarity >= threshold
-
-            return success, max_similarity, {
-                "model_similarity": max_similarity,
-                "dtw_used": False,
-                "threshold": threshold,
-            }
-
-    def extract_enhanced_feature(
-        self,
-        raw_feature: np.ndarray,
-        user_id: Optional[int] = None
-    ) -> np.ndarray:
-        normalized = self.normalizer.normalize(raw_feature, user_id=user_id)
-        embedding = self.model.get_embedding(normalized)
-        enhanced = np.concatenate([normalized, embedding])
-        return enhanced
+            return False, "Model training produced no output"
+        except Exception as e:
+            print(f"[Tenant {tenant_id}] Model training failed: {e}")
+            return False, str(e)
 
 
-def get_model_manager() -> ModelManager:
-    return ModelManager()
+_model_manager_instance: Optional[MultiTenantModelManager] = None
+
+
+def get_model_manager() -> MultiTenantModelManager:
+    global _model_manager_instance
+    if _model_manager_instance is None:
+        _model_manager_instance = MultiTenantModelManager()
+    return _model_manager_instance

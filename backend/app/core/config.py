@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:password@localhost:5432/webauthn_voiceprint"
     secret_key: str = "your-secret-key-here"
     access_token_expire_minutes: int = 30
+    admin_token_expire_minutes: int = 120
 
     webauthn_rp_id: str = "localhost"
     webauthn_rp_name: str = "VoiceAuth"
@@ -28,6 +29,27 @@ class Settings(BaseSettings):
     }
 
     feature_normalization: str = "cmvn_histogram"
+
+    enable_fallback_mode: bool = True
+    circuit_failure_threshold: int = 5
+    circuit_timeout_seconds: int = 60
+    fallback_cache_ttl_minutes: int = 30
+
+    enable_anomaly_detection: bool = True
+    multi_location_window_minutes: int = 30
+    high_freq_attempts_window_seconds: int = 300
+    high_freq_attempts_threshold: int = 15
+    voiceprint_reuse_threshold: float = 0.85
+
+    default_tenant_name: str = "Default"
+    default_tenant_domain: str = "default.local"
+    default_tenant_language: str = "zh-CN"
+
+    reconciliation_worker_interval_seconds: int = 10
+    fallback_cache_dir: str = "fallback_cache"
+    reconciliation_max_age_hours: int = 24
+
+    redis_url: str = ""
 
     class Config:
         env_file = ".env"

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
@@ -10,16 +10,20 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    pass
+    tenant_id: Optional[int] = None
 
 
 class UserResponse(BaseModel):
     id: int
+    tenant_id: int
     username: str
     email: str
     display_name: Optional[str] = None
+    role: Optional[str] = "user"
     created_at: datetime
     is_active: bool
+    last_login_at: Optional[datetime] = None
+    last_login_ip: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -111,3 +115,70 @@ class VoiceVerifyResponse(BaseModel):
     user: Optional[UserResponse] = None
     similarity: Optional[float] = None
     message: str
+    anomaly_detected: Optional[bool] = False
+    anomaly_count: Optional[int] = 0
+    fallback_available: Optional[bool] = False
+    fallback_method: Optional[str] = None
+    service_degraded: Optional[bool] = False
+
+
+class TenantResponse(BaseModel):
+    id: int
+    name: str
+    domain: str
+    language: Optional[str] = None
+    accent_region: Optional[str] = None
+    status: Optional[str] = None
+    voiceprint_threshold: Optional[float] = None
+    created_at: Optional[datetime] = None
+    settings: Optional[Dict[str, Any]] = None
+
+    class Config:
+        from_attributes = True
+
+
+class LoginLogResponse(BaseModel):
+    id: int
+    tenant_id: int
+    user_id: Optional[int] = None
+    username: Optional[str] = None
+    auth_method: str
+    status: str
+    ip_address: Optional[str] = None
+    location: Optional[str] = None
+    similarity_score: Optional[float] = None
+    anomaly_detected: Optional[bool] = False
+    fallback_triggered: Optional[bool] = False
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AnomalyEventResponse(BaseModel):
+    id: int
+    tenant_id: int
+    type: str
+    severity: Optional[str] = "medium"
+    description: Optional[str] = None
+    user_id: Optional[int] = None
+    status: Optional[str] = "new"
+    details: Optional[Dict[str, Any]] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ServiceHealthResponse(BaseModel):
+    is_available: bool
+    circuit_state: str
+    fallback_enabled: bool
+    fallback_method: str
+
+
+class PaginatedResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: List[Any]
