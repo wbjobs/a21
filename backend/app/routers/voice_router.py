@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import Dict, Optional
 import uuid
@@ -14,6 +14,7 @@ from app.schemas import (
     Token,
 )
 from app.services.voice_service import VoiceService
+from app.services.model_manager import get_model_manager
 from app.core.security import get_current_active_user, create_access_token
 from app.core.config import settings
 from datetime import timedelta
@@ -109,10 +110,12 @@ def verify_voiceprint(
             user_vectors[vp.user_id] = []
         user_vectors[vp.user_id].append(vp.feature_vector)
 
+    best_details = None
     for user_id, vectors in user_vectors.items():
-        match, similarity = VoiceService.verify_voiceprints(feature_vector, vectors)
+        match, similarity, details = VoiceService.verify_voiceprints(feature_vector, vectors, use_dtw=True)
         if similarity > best_similarity:
             best_similarity = similarity
+            best_details = details
             if match:
                 best_user = db.query(User).filter(User.id == user_id).first()
 
@@ -122,14 +125,18 @@ def verify_voiceprint(
             success=True,
             user=best_user,
             similarity=round(best_similarity, 4),
-            message="Voice verification successful"
+            message=f"Voice verification successful. Method: {best_details.get('method', 'advanced')}"
         )
     else:
+        details_msg = f"Best similarity: {round(best_similarity, 4)}, threshold: {threshold}"
+        if best_details and best_details.get('best_match'):
+            bm = best_details['best_match']
+            details_msg += f" | Model: {bm.get('model_similarity', 'N/A')}, DTW: {bm.get('dtw_similarity', 'N/A')}"
         return VoiceVerifyResponse(
             success=False,
             user=None,
             similarity=round(best_similarity, 4) if best_similarity > 0 else None,
-            message=f"Voice not recognized. Best similarity: {round(best_similarity, 4)}, threshold: {threshold}"
+            message=f"Voice not recognized. {details_msg}"
         )
 
 
@@ -170,18 +177,24 @@ def verify_and_login(
             user_vectors[vp.user_id] = []
         user_vectors[vp.user_id].append(vp.feature_vector)
 
+    best_details = None
     for user_id, vectors in user_vectors.items():
-        match, similarity = VoiceService.verify_voiceprints(feature_vector, vectors)
+        match, similarity, details = VoiceService.verify_voiceprints(feature_vector, vectors, use_dtw=True)
         if similarity > best_similarity:
             best_similarity = similarity
+            best_details = details
             if match:
                 best_user = db.query(User).filter(User.id == user_id).first()
 
     threshold = settings.voiceprint_similarity_threshold
     if not best_user or best_similarity < threshold:
+        details_msg = f"Best similarity: {round(best_similarity, 4)}, threshold: {threshold}"
+        if best_details and best_details.get('best_match'):
+            bm = best_details['best_match']
+            details_msg += f" | Model: {bm.get('model_similarity', 'N/A')}, DTW: {bm.get('dtw_similarity', 'N/A')}"
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Voice not recognized. Best similarity: {round(best_similarity, 4)}"
+            detail=f"Voice not recognized. {details_msg}"
         )
 
     access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
@@ -236,3 +249,54 @@ def delete_voiceprint(
     db.delete(voiceprint)
     db.commit()
     return {"message": "Voiceprint deleted successfully"}
+
+
+@router.get("/model/info")
+def get_model_info(
+    current_user: User = Depends(get_current_active_user),
+):
+    model_manager = get_model_manager()
+    return model_manager.get_model_info()
+
+
+@router.post("/model/reload")
+def reload_model(
+    current_user: User = Depends(get_current_active_user),
+):
+    model_manager = get_model_manager()
+    model_manager.reload_models()
+    return {"message": "Model reloaded successfully", "info": model_manager.get_model_info()}
+
+
+@router.post("/model/train")
+def train_model(
+    background_tasks: BackgroundTasks,
+    n_epochs: int = 50,
+    current_user: User = Depends(get_current_active_user),
+):
+    if not current_user.username == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can trigger model training"
+        )
+
+    def run_training():
+        import subprocess
+        import sys
+        subprocess.run([
+            sys.executable, "scripts/train_siamese.py",
+            "--epochs", str(n_epochs),
+            "--output", "backend/models/voiceprint_siamese.pt"
+        ], cwd="backend")
+
+    background_tasks.add_task(run_training)
+    return {"message": "Model training started in background"}
+
+
+@router.get("/model/threshold")
+def get_threshold():
+    return {
+        "threshold": settings.voiceprint_similarity_threshold,
+        "description": "Similarity threshold for voice verification (0-1)",
+        "recommended_range": "0.65-0.85 for Siamese model",
+    }
